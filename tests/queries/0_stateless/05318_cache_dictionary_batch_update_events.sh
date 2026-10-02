@@ -63,9 +63,10 @@ done
 wait
 after=$(read_events)
 cat "${CLICKHOUSE_TMP}"/events_inside_*.out | sort | uniq -c | sed -E 's/^ *[0-9]+ //'
-# No duplicate keys, and the requested rows are the found rows plus the distinct missing keys.
-# The requests depend on the timing, so they are not printed.
+# Duplicate keys, found keys, missing keys and requested keys: the requests depend on the timing, so they are not printed.
 print_delta "$before" "$after" | cut -f 2-5
+# 45000 of 48000 rows find their key in the source: the 3000 rows of the last client do not.
+$CLICKHOUSE_CLIENT -q "SELECT round(found_rate, 4) FROM system.dictionaries WHERE database = currentDatabase() AND name = 'cache_dict_events'"
 
 function check_across_units()
 {
@@ -80,9 +81,9 @@ function check_across_units()
     wait
     after=$(read_events)
     cat "${CLICKHOUSE_TMP}"/events_across_*.out | sort | uniq -c | sed -E 's/^ *[0-9]+ //'
-    # Fewer source requests than units, some keys requested by more than one unit,
+    # Fewer source requests than units, some keys requested by more than one unit, each request finds its 1000 keys,
     # and the requested keys are the found keys plus the missing keys.
-    print_delta "$before" "$after" | awk '{print ($1 < 16), ($2 > 0), ($5 == $3 + $4)}'
+    print_delta "$before" "$after" | awk '{print ($1 < 16), ($2 > 0), ($3 == $1 * 1000), ($5 == $3 + $4)}'
 }
 
 # The first unit takes the update thread for 1 second, so the units of the other clients wait in the queue

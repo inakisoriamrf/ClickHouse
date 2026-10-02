@@ -591,8 +591,14 @@ CacheDictionaryUpdateKeys CacheDictionary<dictionary_key_type>::update(VectorWit
     const auto & first_unit_ptr = update_units.front();
     Arena * complex_key_arena = first_unit_ptr->complex_keys_arena_holder.getComplexKeyArena();
 
-    /// Requested keys that are not found in the source yet, with the last unit that requested each key.
-    HashMap<KeyType, size_t> not_found_keys;
+    /// Requested keys that are not found in the source yet, with the last unit that requested each key
+    /// and the number of rows that requested it.
+    struct RequestedKey
+    {
+        size_t last_unit_index;
+        size_t rows;
+    };
+    HashMap<KeyType, RequestedKey> not_found_keys;
 
     VectorWithMemoryTracking<UInt64> requested_keys_vector;
     VectorWithMemoryTracking<size_t> requested_complex_key_rows;
@@ -612,13 +618,13 @@ CacheDictionaryUpdateKeys CacheDictionary<dictionary_key_type>::update(VectorWit
         {
             if (key_index_to_state_from_storage[i].isExpired() || key_index_to_state_from_storage[i].isNotFound())
             {
-                typename HashMap<KeyType, size_t>::LookupResult it;
+                typename HashMap<KeyType, RequestedKey>::LookupResult it;
                 bool inserted;
                 not_found_keys.emplace(requested_keys[i], it, inserted);
 
                 if (inserted)
                 {
-                    it->getMapped() = unit_index;
+                    it->getMapped() = {unit_index, 1};
                     ++update_keys.unit_keys;
 
                     if constexpr (dictionary_key_type == DictionaryKeyType::Simple)
@@ -626,10 +632,16 @@ CacheDictionaryUpdateKeys CacheDictionary<dictionary_key_type>::update(VectorWit
                     else
                         requested_complex_key_rows.emplace_back(i);
                 }
-                else if (it->getMapped() != unit_index)
+                else
                 {
-                    it->getMapped() = unit_index;
-                    ++update_keys.unit_keys;
+                    auto & requested_key = it->getMapped();
+                    ++requested_key.rows;
+
+                    if (requested_key.last_unit_index != unit_index)
+                    {
+                        requested_key.last_unit_index = unit_index;
+                        ++update_keys.unit_keys;
+                    }
                 }
             }
         }
@@ -639,7 +651,7 @@ CacheDictionaryUpdateKeys CacheDictionary<dictionary_key_type>::update(VectorWit
 
     update_keys.batch_keys = not_found_keys.size();
 
-    ProfileEvents::increment(ProfileEvents::DictCacheKeysRequested, requested_keys_size);
+    ProfileEvents::increment(ProfileEvents::DictCacheKeysRequested, update_keys.batch_keys);
     ProfileEvents::increment(ProfileEvents::DictCacheKeysRequestedDuplicate, update_keys.unit_keys - update_keys.batch_keys);
 
     const auto & fetch_request = first_unit_ptr->request;
@@ -648,6 +660,8 @@ CacheDictionaryUpdateKeys CacheDictionary<dictionary_key_type>::update(VectorWit
 
     if (now > backoff_end_time.load())
     {
+        size_t not_found_rows_in_source = 0;
+
         try
         {
             auto current_source_ptr = getSourceAndUpdateIfNeeded();
@@ -711,7 +725,10 @@ CacheDictionaryUpdateKeys CacheDictionary<dictionary_key_type>::update(VectorWit
             not_found_keys_in_source.reserve(not_found_keys.size());
 
             for (auto & cell : not_found_keys)
+            {
                 not_found_keys_in_source.emplace_back(cell.getKey());
+                not_found_rows_in_source += cell.getMapped().rows;
+            }
 
             for (const auto & update_unit_ptr : update_units)
             {
@@ -757,13 +774,13 @@ CacheDictionaryUpdateKeys CacheDictionary<dictionary_key_type>::update(VectorWit
             }
         }
 
-        /// The underlying source can have duplicates, so count only unique keys this formula is used.
-        size_t found_keys_size = requested_keys_size - not_found_keys.size();
-        ProfileEvents::increment(ProfileEvents::DictCacheKeysRequestedMiss, requested_keys_size - found_keys_size);
-        ProfileEvents::increment(ProfileEvents::DictCacheKeysRequestedFound, found_keys_size);
+        /// The underlying source can have duplicates, so count the found keys from the keys that are not found.
+        ProfileEvents::increment(ProfileEvents::DictCacheKeysRequestedMiss, not_found_keys.size());
+        ProfileEvents::increment(ProfileEvents::DictCacheKeysRequestedFound, update_keys.batch_keys - not_found_keys.size());
         ProfileEvents::increment(ProfileEvents::DictCacheRequests);
 
-        found_count.fetch_add(found_keys_size, std::memory_order_relaxed);
+        /// found_count is compared with query_count, which counts rows.
+        found_count.fetch_add(requested_keys_size - not_found_rows_in_source, std::memory_order_relaxed);
     }
     else
     {
